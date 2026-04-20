@@ -43,6 +43,9 @@ def no_batch_collate_fn(batch):
     return batch[0]
 
 
+####################################################################################################
+############################### ViT QUANTIZATION AND EXPORT PART ###################################
+####################################################################################################
 class ViTCalibrationDataset(Dataset):
     """
     A dataset that uses LeRobotSingleDataset for ViT calibration data.
@@ -131,6 +134,215 @@ class ViTCalibrationDataset(Dataset):
         except Exception as e:
             print(f"Warning: ViT data processing failed: {e}, using dummy data")
             raise RuntimeError(f"apply_transforms() failed: {e}")
+
+
+
+def quantize_vit(
+    model,
+    precision="fp8",
+    calib_size=10,
+    dataset_path=None,
+    modality_configs=None,
+    embodiment_tag="gr1",
+    video_backend="decord",
+    policy=None,
+    data_config="fourier_gr1_arms_only",
+):
+    """
+    Quantize the ViT model using FP8 quantization.
+
+    Args:
+        model: The ViT model to quantize
+        precision: Quantization precision (fp8, fp16, etc.)
+        calib_size: Number of calibration samples
+        dataset_path: Path to LeRobot dataset
+        modality_configs: Modality configuration
+        embodiment_tag: Embodiment tag
+        video_backend: Video backend
+        policy: Gr00tPolicy instance
+
+    Returns:
+        Quantized model
+    """
+    if mtq is None:
+        raise ImportError("modelopt is required for quantization")
+
+    assert precision in [
+        "fp8",
+        "fp16",
+    ], f"Only fp8 and fp16 are supported for ViT. You passed: {precision}."
+
+    # FP8 quantization configuration
+    quant_cfg = mtq.FP8_DEFAULT_CFG
+
+    # Disable Conv to avoid accuracy degradation.
+    quant_cfg["quant_cfg"]["nn.Conv2d"] = {"*": {"enable": False}}
+
+    # Create the dataset and dataloader
+    if dataset_path is None or modality_configs is None or policy is None:
+        raise ValueError(
+            "ViT quantization requires valid dataset_path, modality_configs, and policy."
+        )
+
+    print(f"Using LeRobot dataset for ViT calibration: {dataset_path}")
+    data_config_obj = load_data_config(data_config)
+    modality_config = data_config_obj.modality_config()
+    dataset = ViTCalibrationDataset(
+        dataset_path=dataset_path,
+        modality_configs=modality_config,
+        embodiment_tag=embodiment_tag,
+        policy=policy,
+        calib_size=calib_size,
+        video_backend=video_backend,
+    )
+
+    data_loader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=no_batch_collate_fn)
+
+    # Quantize the model if quantization config is provided
+    if quant_cfg is not None:
+        quantized_model = _quantize_model(model, data_loader, quant_cfg)
+        mtq.print_quant_summary(quantized_model)
+
+        return quantized_model
+    else:
+        print("No quantization applied to ViT model")
+        return model
+    
+
+def export_eagle2_vit(
+    vision_model,
+    output_dir,
+    vit_dtype="fp16",
+    calib_dataset_path=None,
+    modality_configs=None,
+    embodiment_tag="gr1",
+    calib_size=10,
+    policy=None,
+    data_config="fourier_gr1_arms_only",
+    video_backend="decord",
+):
+    class SiglipVisionEmbeddingsOpt(SiglipVisionEmbeddings):
+        def __init__(self, config):
+            super().__init__(config)
+
+        def forward(
+            self,
+            pixel_values: torch.FloatTensor,
+            position_ids: torch.LongTensor,  # position_ids is now an input
+            interpolate_pos_encoding=False,
+        ) -> torch.Tensor:
+            _, _, height, width = pixel_values.shape
+            target_dtype = self.patch_embedding.weight.dtype
+            patch_embeds = self.patch_embedding(
+                pixel_values.to(dtype=target_dtype)
+            )  # shape = [*, width, grid, grid]
+            embeddings = patch_embeds.flatten(2).transpose(1, 2)
+
+            if interpolate_pos_encoding:
+                embeddings = embeddings + self.interpolate_pos_encoding(embeddings, height, width)
+            else:
+                embeddings = embeddings + self.position_embedding(position_ids)
+            return embeddings
+
+    class SiglipVisionTransformerOpt(SiglipVisionTransformer):
+        def __init__(self, config: SiglipVisionConfig):
+            config._attn_implementation = "eager"
+            super().__init__(config)
+            self.embeddings = SiglipVisionEmbeddingsOpt(config)
+
+        def forward(
+            self,
+            pixel_values,
+            position_ids,  # Pass position_ids as input
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            interpolate_pos_encoding: Optional[bool] = False,
+        ):
+            output_attentions = (
+                output_attentions
+                if output_attentions is not None
+                else self.config.output_attentions
+            )
+            output_hidden_states = (
+                output_hidden_states
+                if output_hidden_states is not None
+                else self.config.output_hidden_states
+            )
+
+            hidden_states = self.embeddings(
+                pixel_values,
+                position_ids=position_ids,
+                interpolate_pos_encoding=interpolate_pos_encoding,
+            )
+
+            encoder_outputs = self.encoder(
+                inputs_embeds=hidden_states,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+            )
+
+            last_hidden_state = encoder_outputs.last_hidden_state
+            last_hidden_state = self.post_layernorm(last_hidden_state)
+
+            return last_hidden_state
+
+    model = SiglipVisionTransformerOpt(vision_model.config).to(torch.float16)
+    model.load_state_dict(vision_model.state_dict())
+    model.eval().cuda()
+    
+    # Quantize ViT if requested
+    if vit_dtype == "fp8":
+        print("Quantizing Eagle2 ViT to fp8")
+        model = quantize_vit(
+            model,
+            precision="fp8",
+            calib_size=calib_size,
+            dataset_path=calib_dataset_path,
+            modality_configs=modality_configs,
+            embodiment_tag=embodiment_tag,
+            policy=policy,
+            data_config=data_config,
+            video_backend=video_backend,
+        )
+
+    # Get the number of video views from modality_configs
+    num_video_views = 1
+    if modality_configs is not None and "video" in modality_configs:
+        num_video_views = len(modality_configs["video"].modality_keys)
+        print(f"Number of video views detected from modality config: {num_video_views}")
+    else:
+        print(f"Using default number of video views: {num_video_views}")
+
+    pixel_values = torch.randn(
+        (
+            num_video_views,
+            model.config.num_channels,
+            model.config.image_size,
+            model.config.image_size,
+        ),
+        dtype=torch.float16,
+        device="cuda",
+    )
+    position_ids = torch.arange(model.embeddings.num_patches, device="cuda").expand(
+        (num_video_views, -1)
+    )
+
+    os.makedirs(output_dir, exist_ok=True)
+    with torch.inference_mode():
+        torch.onnx.export(
+            model,
+            (pixel_values, position_ids),  # Include position_ids in ONNX export
+            f"{output_dir}/eagle2/vit_{vit_dtype}.onnx",
+            input_names=["pixel_values", "position_ids"],  # Add position_ids to input names
+            output_names=["vit_embeds"],
+            opset_version=19,
+            do_constant_folding=True,
+            dynamic_axes={
+                "pixel_values": {0: "batch_size"},
+                "position_ids": {0: "batch_size"},
+                "vit_embeds": {0: "batch_size"},
+            },
+        )
 
 
 class LLMCalibrationDataset(Dataset):
@@ -397,7 +609,7 @@ class DiTCalibrationDataset(Dataset):
 
             # Embed state.
             state_features = self.policy.model.action_head.state_encoder(
-                action_inputs["state"], embodiment_id
+                action_inputs["state"].to(vl_embs.dtype), embodiment_id
             )
 
             # Set initial actions as the sampled noise.
@@ -414,9 +626,9 @@ class DiTCalibrationDataset(Dataset):
             )
 
             return {
-                "vl_embs": vl_embs,  # Remove batch dimension
-                "state_features": state_features,  # Remove batch dimension
-                "actions": actions,  # Remove batch dimension
+                "vl_embs": vl_embs.to(torch.float16),  # Remove batch dimension
+                "state_features": state_features.to(torch.float16),  # Remove batch dimension
+                "actions": actions.to(torch.float16),  # Remove batch dimension
                 "embodiment_id": embodiment_id,  # Remove batch dimension
             }
         except Exception as e:
@@ -450,6 +662,7 @@ def _quantize_dit_model(model, calib_dataloader, quant_cfg, action_head):
     Custom calibration loop for DiT model that runs the full denoising process.
     DiT requires multiple forward passes (typically 4 steps) for proper calibration.
     """
+
 
     def calibrate_loop(model):
         """Run the denoising loop for DiT calibration."""
@@ -529,93 +742,6 @@ def _quantize_dit_model(model, calib_dataloader, quant_cfg, action_head):
     return model
 
 
-def quantize_vit(
-    model,
-    precision="fp8",
-    calib_size=10,
-    batch_size=1,
-    dataset_path=None,
-    modality_configs=None,
-    embodiment_tag="gr1",
-    video_backend="decord",
-    policy=None,
-    compare_accuracy=True,
-    denoising_steps=4,
-    data_config="fourier_gr1_arms_only",
-    model_path="nvidia/GR00T-N1.5-3B",
-):
-    """
-    Quantize the ViT model using FP8 quantization.
-
-    Args:
-        model: The ViT model to quantize
-        precision: Quantization precision (fp8, fp16, etc.)
-        calib_size: Number of calibration samples
-        batch_size: Batch size for calibration
-        dataset_path: Path to LeRobot dataset
-        modality_configs: Modality configuration
-        embodiment_tag: Embodiment tag
-        video_backend: Video backend
-        policy: Gr00tPolicy instance
-        compare_accuracy: Whether to compare accuracy before/after quantization
-
-    Returns:
-        Quantized model
-    """
-    if mtq is None:
-        raise ImportError("modelopt is required for quantization")
-
-    assert precision in [
-        "fp8",
-        "fp16",
-    ], f"Only fp8 and fp16 are supported for ViT. You passed: {precision}."
-
-    # FP8 quantization configuration
-    quant_cfg = mtq.FP8_DEFAULT_CFG
-
-    # Disable Conv to avoid accuracy degradation.
-    quant_cfg["quant_cfg"]["nn.Conv2d"] = {"*": {"enable": False}}
-
-    # Create the dataset and dataloader
-    if dataset_path is None or modality_configs is None or policy is None:
-        raise ValueError(
-            "ViT quantization requires valid dataset_path, modality_configs, and policy."
-        )
-
-    print(f"Using LeRobot dataset for ViT calibration: {dataset_path}")
-    data_config_obj = load_data_config(data_config)
-    modality_config = data_config_obj.modality_config()
-    modality_transform = data_config_obj.transform()
-    device = "cuda"
-    policy_copy2 = Gr00tPolicy(
-        model_path=model_path,
-        embodiment_tag=embodiment_tag,
-        modality_config=modality_config,
-        modality_transform=modality_transform,
-        denoising_steps=denoising_steps,
-        device=device,
-    )
-    dataset = ViTCalibrationDataset(
-        dataset_path=dataset_path,
-        modality_configs=modality_config,
-        embodiment_tag=embodiment_tag,
-        policy=policy_copy2,
-        calib_size=calib_size,
-        video_backend=video_backend,
-    )
-
-    data_loader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=no_batch_collate_fn)
-
-    # Quantize the model if quantization config is provided
-    if quant_cfg is not None:
-        quantized_model = _quantize_model(model, data_loader, quant_cfg)
-        mtq.print_quant_summary(quantized_model)
-
-        return quantized_model
-    else:
-        print("No quantization applied to ViT model")
-        return model
-
 
 def quantize_dit(
     model,
@@ -678,20 +804,11 @@ def quantize_dit(
     data_config_obj = load_data_config(data_config)
     modality_config = data_config_obj.modality_config()
     modality_transform = data_config_obj.transform()
-    device = "cuda"
-    policy_copy = Gr00tPolicy(
-        model_path=model_path,
-        embodiment_tag=embodiment_tag,
-        modality_config=modality_config,
-        modality_transform=modality_transform,
-        denoising_steps=denoising_steps,
-        device=device,
-    )
     dataset = DiTCalibrationDataset(
         dataset_path=dataset_path,
         modality_configs=modality_config,
         embodiment_tag=embodiment_tag,
-        policy=policy_copy,
+        policy=policy,
         calib_size=calib_size,
         video_backend=video_backend,
     )
@@ -699,10 +816,11 @@ def quantize_dit(
     data_loader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=no_batch_collate_fn)
 
     # Quantize the model if quantization config is provided
+    from copy import deepcopy
     if quant_cfg is not None:
         # Use custom DiT calibration function that runs the denoising loop
         quantized_model = _quantize_dit_model(
-            model, data_loader, quant_cfg, policy_copy.model.action_head
+            model, data_loader, quant_cfg, deepcopy(policy.model.action_head).to(torch.float16)
         )
         mtq.print_quant_summary(quantized_model)
 
@@ -890,19 +1008,19 @@ def quantize_llm(
     modality_config = data_config_obj.modality_config()
     modality_transform = data_config_obj.transform()
     device = "cuda"
-    policy_copy = Gr00tPolicy(
-        model_path=model_path,
-        embodiment_tag=embodiment_tag,
-        modality_config=modality_config,
-        modality_transform=modality_transform,
-        denoising_steps=denoising_steps,
-        device=device,
-    )
+    # policy_copy = Gr00tPolicy(
+    #     model_path=model_path,
+    #     embodiment_tag=embodiment_tag,
+    #     modality_config=modality_config,
+    #     modality_transform=modality_transform,
+    #     denoising_steps=denoising_steps,
+    #     device=device,
+    # )
     dataset = LLMCalibrationDataset(
         dataset_path=dataset_path,
         modality_configs=modality_configs,
         embodiment_tag=embodiment_tag,
-        policy=policy_copy,
+        policy=policy,
         calib_size=calib_size,
         video_backend=video_backend,
     )
@@ -955,146 +1073,6 @@ def get_input_info(policy, observations):
     normalized_input = policy.apply_transforms(observations)
 
     return normalized_input["eagle_attention_mask"], normalized_input["state"]
-
-
-def export_eagle2_vit(
-    vision_model,
-    output_dir,
-    vit_dtype="fp16",
-    calib_dataset_path=None,
-    modality_configs=None,
-    embodiment_tag="gr1",
-    calib_size=10,
-    policy=None,
-    denoising_steps=4,
-    data_config="fourier_gr1_arms_only",
-    model_path="nvidia/GR00T-N1.5-3B",
-    video_backend="decord",
-):
-    class SiglipVisionEmbeddingsOpt(SiglipVisionEmbeddings):
-        def __init__(self, config):
-            super().__init__(config)
-
-        def forward(
-            self,
-            pixel_values: torch.FloatTensor,
-            position_ids: torch.LongTensor,  # position_ids is now an input
-            interpolate_pos_encoding=False,
-        ) -> torch.Tensor:
-            _, _, height, width = pixel_values.shape
-            target_dtype = self.patch_embedding.weight.dtype
-            patch_embeds = self.patch_embedding(
-                pixel_values.to(dtype=target_dtype)
-            )  # shape = [*, width, grid, grid]
-            embeddings = patch_embeds.flatten(2).transpose(1, 2)
-
-            if interpolate_pos_encoding:
-                embeddings = embeddings + self.interpolate_pos_encoding(embeddings, height, width)
-            else:
-                embeddings = embeddings + self.position_embedding(position_ids)
-            return embeddings
-
-    class SiglipVisionTransformerOpt(SiglipVisionTransformer):
-        def __init__(self, config: SiglipVisionConfig):
-            config._attn_implementation = "eager"
-            super().__init__(config)
-            self.embeddings = SiglipVisionEmbeddingsOpt(config)
-
-        def forward(
-            self,
-            pixel_values,
-            position_ids,  # Pass position_ids as input
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            interpolate_pos_encoding: Optional[bool] = False,
-        ):
-            output_attentions = (
-                output_attentions
-                if output_attentions is not None
-                else self.config.output_attentions
-            )
-            output_hidden_states = (
-                output_hidden_states
-                if output_hidden_states is not None
-                else self.config.output_hidden_states
-            )
-
-            hidden_states = self.embeddings(
-                pixel_values,
-                position_ids=position_ids,
-                interpolate_pos_encoding=interpolate_pos_encoding,
-            )
-
-            encoder_outputs = self.encoder(
-                inputs_embeds=hidden_states,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-            )
-
-            last_hidden_state = encoder_outputs.last_hidden_state
-            last_hidden_state = self.post_layernorm(last_hidden_state)
-
-            return last_hidden_state
-
-    model = SiglipVisionTransformerOpt(vision_model.config).to(torch.float16)
-    model.load_state_dict(vision_model.state_dict())
-    model.eval().cuda()
-
-    # Quantize ViT if requested
-    if vit_dtype == "fp8":
-        print("Quantizing Eagle2 ViT to fp8")
-        model = quantize_vit(
-            model,
-            precision="fp8",
-            calib_size=calib_size,
-            dataset_path=calib_dataset_path,
-            modality_configs=modality_configs,
-            embodiment_tag=embodiment_tag,
-            policy=policy,
-            denoising_steps=denoising_steps,
-            data_config=data_config,
-            model_path=model_path,
-            video_backend=video_backend,
-        )
-
-    # Get the number of video views from modality_configs
-    num_video_views = 1
-    if modality_configs is not None and "video" in modality_configs:
-        num_video_views = len(modality_configs["video"].modality_keys)
-        print(f"Number of video views detected from modality config: {num_video_views}")
-    else:
-        print(f"Using default number of video views: {num_video_views}")
-
-    pixel_values = torch.randn(
-        (
-            num_video_views,
-            model.config.num_channels,
-            model.config.image_size,
-            model.config.image_size,
-        ),
-        dtype=torch.float16,
-        device="cuda",
-    )
-    position_ids = torch.arange(model.embeddings.num_patches, device="cuda").expand(
-        (num_video_views, -1)
-    )
-
-    os.makedirs(output_dir, exist_ok=True)
-    with torch.inference_mode():
-        torch.onnx.export(
-            model,
-            (pixel_values, position_ids),  # Include position_ids in ONNX export
-            f"{output_dir}/eagle2/vit_{vit_dtype}.onnx",
-            input_names=["pixel_values", "position_ids"],  # Add position_ids to input names
-            output_names=["vit_embeds"],
-            opset_version=19,
-            do_constant_folding=True,
-            dynamic_axes={
-                "pixel_values": {0: "batch_size"},
-                "position_ids": {0: "batch_size"},
-                "vit_embeds": {0: "batch_size"},
-            },
-        )
 
 
 def export_eagle2_llm(
@@ -1271,83 +1249,82 @@ def export_action_head(
         embodiment_tag: Embodiment tag
         calib_size: Number of calibration samples
     """
-    process_backbone_model = (
-        VLLN_VLSelfAttention(
-            policy.model.action_head.vlln, policy.model.action_head.vl_self_attention
-        )
-        .to(torch.float16)
-        .cuda()
-    )
-    backbone_features = torch.randn(
-        (1, attention_mask.shape[1], policy.model.action_head.config.backbone_embedding_dim),
-        dtype=torch.float16,
-    ).cuda()
+    # process_backbone_model = (
+    #     VLLN_VLSelfAttention(
+    #         policy.model.action_head.vlln, policy.model.action_head.vl_self_attention
+    #     )
+    #     .to(torch.float16)
+    # )
+    # backbone_features = torch.randn(
+    #     (1, attention_mask.shape[1], policy.model.action_head.config.backbone_embedding_dim),
+    #     dtype=torch.float16,
+    # ).cuda()
 
-    torch.onnx.export(
-        process_backbone_model,
-        (backbone_features),
-        os.path.join(ONNX_export_path, "action_head/vlln_vl_self_attention.onnx"),
-        export_params=True,
-        do_constant_folding=True,
-        input_names=["backbone_features"],
-        output_names=["output"],
-        dynamic_axes={
-            "backbone_features": {0: "batch_size", 1: "sequence_length"},
-            "output": {0: "batch_size", 1: "sequence_length"},
-        },
-    )
+    # torch.onnx.export(
+    #     process_backbone_model,
+    #     (backbone_features),
+    #     os.path.join(ONNX_export_path, "action_head/vlln_vl_self_attention.onnx"),
+    #     export_params=True,
+    #     do_constant_folding=True,
+    #     input_names=["backbone_features"],
+    #     output_names=["output"],
+    #     dynamic_axes={
+    #         "backbone_features": {0: "batch_size", 1: "sequence_length"},
+    #         "output": {0: "batch_size", 1: "sequence_length"},
+    #     },
+    # )
 
-    state_encoder = policy.model.action_head.state_encoder.to(torch.float16)
+    # state_encoder = policy.model.action_head.state_encoder.to(torch.float16)
 
-    state_tensor = torch.randn(
-        (1, input_state.shape[1], input_state.shape[2]), dtype=torch.float16
-    ).cuda()
-    embodiment_id_tensor = torch.ones((1), dtype=torch.int64).cuda()
+    # state_tensor = torch.randn(
+    #     (1, input_state.shape[1], input_state.shape[2]), dtype=torch.float16
+    # ).cuda()
+    # embodiment_id_tensor = torch.ones((1), dtype=torch.int64).cuda()
 
-    torch.onnx.export(
-        state_encoder,
-        (state_tensor, embodiment_id_tensor),
-        os.path.join(ONNX_export_path, "action_head/state_encoder.onnx"),
-        export_params=True,
-        do_constant_folding=True,
-        input_names=["state", "embodiment_id"],
-        output_names=["output"],
-        dynamic_axes={
-            "state": {0: "batch_size"},
-            "embodiment_id": {0: "batch_size"},
-            "output": {0: "batch_size"},
-        },
-    )
+    # torch.onnx.export(
+    #     state_encoder,
+    #     (state_tensor, embodiment_id_tensor),
+    #     os.path.join(ONNX_export_path, "action_head/state_encoder.onnx"),
+    #     export_params=True,
+    #     do_constant_folding=True,
+    #     input_names=["state", "embodiment_id"],
+    #     output_names=["output"],
+    #     dynamic_axes={
+    #         "state": {0: "batch_size"},
+    #         "embodiment_id": {0: "batch_size"},
+    #         "output": {0: "batch_size"},
+    #     },
+    # )
 
-    action_encoder = policy.model.action_head.action_encoder.to(torch.float16)
-    actions_tensor = torch.randn(
-        (
-            1,
-            policy.model.action_head.config.action_horizon,
-            policy.model.action_head.config.action_dim,
-        ),
-        dtype=torch.float16,
-    ).cuda()
+    # action_encoder = policy.model.action_head.action_encoder.to(torch.float16)
+    # actions_tensor = torch.randn(
+    #     (
+    #         1,
+    #         policy.model.action_head.config.action_horizon,
+    #         policy.model.action_head.config.action_dim,
+    #     ),
+    #     dtype=torch.float16,
+    # ).cuda()
     timesteps_tensor = torch.ones((1), dtype=torch.int64).cuda()
 
-    torch.onnx.export(
-        action_encoder,
-        (actions_tensor, timesteps_tensor, embodiment_id_tensor),
-        os.path.join(ONNX_export_path, "action_head/action_encoder.onnx"),
-        export_params=True,
-        do_constant_folding=True,
-        input_names=["actions", "timesteps_tensor", "embodiment_id"],
-        output_names=["output"],
-        dynamic_axes={
-            "actions": {0: "batch_size"},
-            "timesteps_tensor": {0: "batch_size"},
-            "embodiment_id": {0: "batch_size"},
-            "output": {0: "batch_size"},
-        },
-    )
+    # torch.onnx.export(
+    #     action_encoder,
+    #     (actions_tensor, timesteps_tensor, embodiment_id_tensor),
+    #     os.path.join(ONNX_export_path, "action_head/action_encoder.onnx"),
+    #     export_params=True,
+    #     do_constant_folding=True,
+    #     input_names=["actions", "timesteps_tensor", "embodiment_id"],
+    #     output_names=["output"],
+    #     dynamic_axes={
+    #         "actions": {0: "batch_size"},
+    #         "timesteps_tensor": {0: "batch_size"},
+    #         "embodiment_id": {0: "batch_size"},
+    #         "output": {0: "batch_size"},
+    #     },
+    # )
 
-    # DiT model with optional FP8 quantization
-    DiT = policy.model.action_head.model.to(torch.float16).cuda()
+    # # DiT model with optional FP8 quantization
+    DiT = policy.model.action_head.model.to(torch.float16)
 
     # Quantize DiT if requested
     if dit_dtype == "fp8":
@@ -1405,31 +1382,31 @@ def export_action_head(
     )
     print(f"DiT ONNX exported to {onnx_path}")
 
-    action_decoder = policy.model.action_head.action_decoder.to(torch.float16)
-    model_output_tensor = torch.randn(
-        (
-            1,
-            input_state.shape[1]
-            + policy.model.action_head.config.action_horizon
-            + policy.model.action_head.config.num_target_vision_tokens,
-            policy.model.action_head.config.hidden_size,
-        ),
-        dtype=torch.float16,
-    ).cuda()
-    torch.onnx.export(
-        action_decoder,
-        (model_output_tensor, embodiment_id_tensor),
-        os.path.join(ONNX_export_path, "action_head/action_decoder.onnx"),
-        export_params=True,
-        do_constant_folding=True,
-        input_names=["model_output", "embodiment_id"],
-        output_names=["output"],
-        dynamic_axes={
-            "model_output": {0: "batch_size"},
-            "embodiment_id": {0: "batch_size"},
-            "output": {0: "batch_size"},
-        },
-    )
+    # action_decoder = policy.model.action_head.action_decoder.to(torch.float16)
+    # model_output_tensor = torch.randn(
+    #     (
+    #         1,
+    #         input_state.shape[1]
+    #         + policy.model.action_head.config.action_horizon
+    #         + policy.model.action_head.config.num_target_vision_tokens,
+    #         policy.model.action_head.config.hidden_size,
+    #     ),
+    #     dtype=torch.float16,
+    # ).cuda()
+    # torch.onnx.export(
+    #     action_decoder,
+    #     (model_output_tensor, embodiment_id_tensor),
+    #     os.path.join(ONNX_export_path, "action_head/action_decoder.onnx"),
+    #     export_params=True,
+    #     do_constant_folding=True,
+    #     input_names=["model_output", "embodiment_id"],
+    #     output_names=["output"],
+    #     dynamic_axes={
+    #         "model_output": {0: "batch_size"},
+    #         "embodiment_id": {0: "batch_size"},
+    #         "output": {0: "batch_size"},
+    #     },
+    # )
 
 
 def run_groot_inference(
@@ -1483,20 +1460,18 @@ def run_groot_inference(
     os.makedirs(os.path.join(onnx_model_path, "eagle2"), exist_ok=True)
     os.makedirs(os.path.join(onnx_model_path, "action_head"), exist_ok=True)
 
-    export_eagle2_vit(
-        policy.model.backbone.eagle_model.vision_model.vision_model,
-        onnx_model_path,
-        vit_dtype=vit_dtype,
-        calib_dataset_path=calib_dataset_path or dataset_path,
-        modality_configs=modality_config,
-        embodiment_tag=embodiment_tag,
-        calib_size=calib_size,
-        policy=policy,
-        denoising_steps=denoising_steps,
-        data_config=data_config,
-        model_path=model_path,
-        video_backend=video_backend,
-    )
+    # export_eagle2_vit(
+    #     policy.model.backbone.eagle_model.vision_model.vision_model,
+    #     onnx_model_path,
+    #     vit_dtype=vit_dtype,
+    #     calib_dataset_path=calib_dataset_path or dataset_path,
+    #     modality_configs=modality_config,
+    #     embodiment_tag=embodiment_tag,
+    #     calib_size=calib_size,
+    #     policy=policy,
+    #     data_config=data_config,
+    #     video_backend=video_backend,
+    # )
     export_eagle2_llm(
         policy.model.backbone,
         policy.model.config.backbone_cfg,
@@ -1514,21 +1489,21 @@ def run_groot_inference(
         video_backend=video_backend,
         full_layer_quant=full_layer_quant,
     )
-    export_action_head(
-        policy,
-        onnx_model_path,
-        state,
-        attention_mask,
-        dit_dtype=dit_dtype,
-        calib_dataset_path=calib_dataset_path or dataset_path,
-        modality_configs=modality_config,
-        embodiment_tag=embodiment_tag,
-        calib_size=calib_size,
-        denoising_steps=denoising_steps,
-        data_config=data_config,
-        model_path=model_path,
-        video_backend=video_backend,
-    )
+    # export_action_head(
+    #     policy,
+    #     onnx_model_path,
+    #     state,
+    #     attention_mask,
+    #     dit_dtype=dit_dtype,
+    #     calib_dataset_path=calib_dataset_path or dataset_path,
+    #     modality_configs=modality_config,
+    #     embodiment_tag=embodiment_tag,
+    #     calib_size=calib_size,
+    #     denoising_steps=denoising_steps,
+    #     data_config=data_config,
+    #     model_path=model_path,
+    #     video_backend=video_backend,
+    # )
 
     return predicted_action
 

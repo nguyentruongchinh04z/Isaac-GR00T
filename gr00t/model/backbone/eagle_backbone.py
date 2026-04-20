@@ -47,8 +47,18 @@ class EagleBackbone(nn.Module):
         super().__init__()
         assert not reproject_vision, "Reproject vision is not implemented here, set to False"
 
-        config = AutoConfig.from_pretrained(DEFAULT_EAGLE_PATH, trust_remote_code=True)
-        self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
+        config = AutoConfig.from_pretrained(
+            DEFAULT_EAGLE_PATH, 
+            trust_remote_code=True
+        )
+        try:
+            import flash_attn   
+            attn_implementation = "flash_attention" if use_flash_attention else "sdpa"
+        except ImportError:
+            print("Flash attention is not installed, using sdpa instead.")
+            attn_implementation = "sdpa"    
+            
+        self.eagle_model = AutoModel.from_config(config, attn_implementation=attn_implementation, trust_remote_code=True)
 
         if project_to_dim is not None:
             self.eagle_linear = torch.nn.Linear(2048, project_to_dim)

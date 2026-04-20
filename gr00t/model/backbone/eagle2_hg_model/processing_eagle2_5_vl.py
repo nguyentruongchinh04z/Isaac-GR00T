@@ -18,6 +18,7 @@ copy from https://github.com/huggingface/transformers/blob/main/src/transformers
 """
 
 import base64
+import importlib
 import math
 import os
 import re
@@ -188,7 +189,12 @@ def _read_video_decord(
     ele: dict,
 ) -> (torch.Tensor, float, list):
     """read video using decord.VideoReader and return also per-frame timestamps"""
-    import decord
+    decord_spec = importlib.util.find_spec("decord")
+    if decord_spec is None:
+        raise ImportError(
+            "decord is not installed. Use torchvision backend or install decord."
+        )
+    decord = importlib.import_module("decord")
 
     video_path = ele["video"]
     st = time.time()

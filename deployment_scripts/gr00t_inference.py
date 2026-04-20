@@ -135,9 +135,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--video-backend",
         type=str,
-        choices=["decord", "torchcodec"],
+        choices=["decord", "torchcodec", "opencv"],
         help="Video backend to use for loading videos",
-        default="decord",
+        default="opencv",
     )
     parser.add_argument(
         "--vit-dtype",
