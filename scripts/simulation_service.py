@@ -26,6 +26,125 @@ from gr00t.eval.simulation import (
 )
 from gr00t.model.policy import Gr00tPolicy
 
+from typing import Dict, Any, Tuple, List
+import requests
+import time
+import gymnasium as gym
+from functools import partial
+
+from gr00t.eval.simulation import SimulationConfig, _create_single_env
+import json_numpy
+
+json_numpy.patch()
+
+class HTTPSimulationInferenceClient:
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 5555,
+        timeout_ms: int = 15000,
+        api_token: str = None,
+    ):
+        self.host = host
+        self.port = port
+        self.env = None
+
+    def get_action(self, observations: Dict[str, Any]) -> Dict[str, Any]:
+        """Get action from the inference server based on observations."""
+        if "video.ego_view_bg_crop_pad_res256_freq20" in observations:
+            observations["video.ego_view"] = observations.pop(
+                "video.ego_view_bg_crop_pad_res256_freq20"
+            )
+        response = requests.post(f"http://{self.host}:{self.port}/act", json={"observation": observations})
+        if response.status_code == 200:
+            action = response.json()
+            return action
+        else:
+            print(f"Error: {response.status_code} - {response.text}")
+            return {}
+        
+    # def get_modality_config(self) -> Dict[str, ModalityConfig]:
+    #     """Get modality configuration from the inference server."""
+    #     return self.call_endpoint("get_modality_config", requires_input=False)
+
+    def _get_actions_from_server(self, observations: Dict[str, Any]) -> Dict[str, Any]:
+        """Process observations and get actions from the inference server."""
+        # Get actions from the server
+        action_dict = self.get_action(observations)
+        # Extract actions from the response
+        if "actions" in action_dict:
+            actions = action_dict["actions"]
+        else:
+            actions = action_dict
+        # Add batch dimension to actions
+        return actions
+    
+
+    def setup_environment(self, config: SimulationConfig) -> gym.vector.VectorEnv:
+        """Set up the simulation environment based on the provided configuration."""
+        # Create environment functions for each parallel environment
+        env_fns = [partial(_create_single_env, config=config, idx=i) for i in range(config.n_envs)]
+        # Create vector environment (sync for single env, async for multiple)
+        if config.n_envs == 1:
+            return gym.vector.SyncVectorEnv(env_fns)
+        else:
+            return gym.vector.AsyncVectorEnv(
+                env_fns,
+                shared_memory=False,
+                context="spawn",
+            )
+
+    def run_simulation(self, config: SimulationConfig) -> Tuple[str, List[bool]]:
+        """Run the simulation for the specified number of episodes."""
+        start_time = time.time()
+        print(
+            f"Running {config.n_episodes} episodes for {config.env_name} with {config.n_envs} environments"
+        )
+        # Set up the environment
+        self.env = self.setup_environment(config)
+        # Initialize tracking variables
+        episode_lengths = []
+        current_rewards = [0] * config.n_envs
+        current_lengths = [0] * config.n_envs
+        completed_episodes = 0
+        current_successes = [False] * config.n_envs
+        episode_successes = []
+        # Initial environment reset
+        obs, _ = self.env.reset()
+        # Main simulation loop
+        while completed_episodes < config.n_episodes:
+            # Process observations and get actions from the server
+            actions = self._get_actions_from_server(obs)
+            # Step the environment
+            next_obs, rewards, terminations, truncations, env_infos = self.env.step(actions)
+            # Update episode tracking
+            for env_idx in range(config.n_envs):
+                current_successes[env_idx] |= bool(env_infos["success"][env_idx][0])
+                current_rewards[env_idx] += rewards[env_idx]
+                current_lengths[env_idx] += 1
+                # If episode ended, store results
+                if terminations[env_idx] or truncations[env_idx]:
+                    episode_lengths.append(current_lengths[env_idx])
+                    episode_successes.append(current_successes[env_idx])
+                    current_successes[env_idx] = False
+                    completed_episodes += 1
+                    # Reset trackers for this environment
+                    current_rewards[env_idx] = 0
+                    current_lengths[env_idx] = 0
+            obs = next_obs
+        # Clean up
+        self.env.reset()
+        self.env.close()
+        self.env = None
+        print(
+            f"Collecting {config.n_episodes} episodes took {time.time() - start_time:.2f} seconds"
+        )
+        assert (
+            len(episode_successes) >= config.n_episodes
+        ), f"Expected at least {config.n_episodes} episodes, got {len(episode_successes)}"
+        return config.env_name, episode_successes
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -81,11 +200,11 @@ if __name__ == "__main__":
 
     elif args.client:
         # Create a simulation client
-        simulation_client = SimulationInferenceClient(host=args.host, port=args.port)
+        simulation_client = HTTPSimulationInferenceClient(host=args.host, port=args.port)
 
-        print("Available modality configs:")
-        modality_config = simulation_client.get_modality_config()
-        print(modality_config.keys())
+        # print("Available modality configs:")
+        # modality_config = simulation_client.get_modality_config()
+        # print(modality_config.keys())
 
         # Create simulation configuration
         config = SimulationConfig(

@@ -13,14 +13,15 @@ Dependencies:
 import json
 import logging
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple, List
+
 
 import json_numpy
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
-from gr00t.model.policy import Gr00tPolicy
+from gr00t.model.policy import BasePolicy, Gr00tPolicy
 
 # Patch json to handle numpy arrays
 json_numpy.patch()
@@ -87,6 +88,7 @@ class HTTPInferenceServer:
         print("  POST /act - Get action prediction from observation")
         print("  GET  /health - Health check")
         uvicorn.run(self.app, host=self.host, port=self.port)
+
 
 
 def create_http_server(

@@ -253,7 +253,7 @@ def run_evaluation(
 if __name__ == "__main__":
     # Example usage
     run_evaluation(
-        env_name="robocasa_gr1_arms_only_fourier_hands/TwoArmPnPCarPartBrakepedal_GR1ArmsOnlyFourierHands_Env",
+        env_name="gr1_unified/PnPCupToDrawerClose_GR1ArmsAndWaistFourierHands_Env",
         host="localhost",
         port=5555,
         video_dir="./videos",
