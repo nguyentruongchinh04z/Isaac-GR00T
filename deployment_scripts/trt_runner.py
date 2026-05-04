@@ -67,73 +67,6 @@ def squeeze_dict_values(data: Dict[str, Any]) -> Dict[str, Any]:
     return squeezed_data
 
 
-def compare_predictions(
-    pred_tensorrt: dict[str, np.ndarray], 
-    pred_torch: dict[str, np.ndarray]
-) -> None:
-    """
-    Compare the similarity between TensorRT and PyTorch predictions
-
-    Args:
-        pred_tensorrt: TensorRT prediction results (numpy array)
-        pred_torch: PyTorch prediction results (numpy array)
-    """
-    print("\n=== Prediction Comparison ===")
-
-    # Ensure both predictions contain the same keys
-    assert pred_tensorrt.keys() == pred_torch.keys(), "Prediction keys do not match"
-
-    # Calculate max label width for alignment
-    max_label_width = max(
-        len("Cosine Similarity (PyTorch/TensorRT):"),
-        len("L1 Mean/Max Distance (PyTorch/TensorRT):"),
-        len("Max Output Values (PyTorch/TensorRT):"),
-        len("Mean Output Values (PyTorch/TensorRT):"),
-        len("Min Output Values (PyTorch/TensorRT):"),
-    )
-
-    for key in pred_tensorrt.keys():
-        tensorrt_array = pred_tensorrt[key]
-        torch_array = pred_torch[key]
-
-        # Convert to PyTorch tensors
-        tensorrt_tensor = torch.from_numpy(tensorrt_array).to(torch.float32)
-        torch_tensor = torch.from_numpy(torch_array).to(torch.float32)
-
-        # Ensure tensor shapes are the same
-        assert (
-            tensorrt_tensor.shape == torch_tensor.shape
-        ), f"{key} shapes do not match: {tensorrt_tensor.shape} vs {torch_tensor.shape}"
-
-        # Calculate cosine similarity
-        flat_tensorrt = tensorrt_tensor.flatten()
-        flat_torch = torch_tensor.flatten()
-
-        # Manually calculate cosine similarity
-        dot_product = torch.dot(flat_tensorrt, flat_torch)
-        norm_tensorrt = torch.norm(flat_tensorrt)
-        norm_torch = torch.norm(flat_torch)
-        cos_sim = dot_product / (norm_tensorrt * norm_torch)
-
-        # Calculate L1 distance
-        l1_dist = torch.abs(flat_tensorrt - flat_torch)
-
-        print(f"\n{key}:")
-        print(f'{"Cosine Similarity (PyTorch/TensorRT):".ljust(max_label_width)} {cos_sim.item()}')
-        print(
-            f'{"L1 Mean/Max Distance (PyTorch/TensorRT):".ljust(max_label_width)} {l1_dist.mean().item():.4f}/{l1_dist.max().item():.4f}'
-        )
-        print(
-            f'{"Max Output Values (PyTorch/TensorRT):".ljust(max_label_width)} {torch_tensor.max().item():.4f}/{tensorrt_tensor.max().item():.4f}'
-        )
-        print(
-            f'{"Mean Output Values (PyTorch/TensorRT):".ljust(max_label_width)} {torch_tensor.mean().item():.4f}/{tensorrt_tensor.mean().item():.4f}'
-        )
-        print(
-            f'{"Min Output Values (PyTorch/TensorRT):".ljust(max_label_width)} {torch_tensor.min().item():.4f}/{tensorrt_tensor.min().item():.4f}'
-        )
-
-
 ####################################################################################################
 ################################## TENSORRT ENGINE PART ############################################
 ####################################################################################################
@@ -275,7 +208,8 @@ class GR00TN1d5TRTPolicy(nn.Module):
         llm_dtype: str = "fp16", 
         dit_dtype: str = "fp16",
         device: Union[int, str] = "cuda",
-        denoising_steps: Optional[int] = None
+        denoising_steps: Optional[int] = None,
+        debug_pipeline: bool = False,
     ):
         super().__init__()
         self.model_path = Path(model_path)
@@ -283,7 +217,7 @@ class GR00TN1d5TRTPolicy(nn.Module):
         self.vit_dtype = vit_dtype
         self.llm_dtype = llm_dtype
         self.dit_dtype = dit_dtype
-
+        self.debug_pipeline = debug_pipeline
         self._modality_config = modality_config
         self._modality_transform = modality_transform
         self._modality_transform.eval()  # set this to eval mode
@@ -392,15 +326,8 @@ class GR00TN1d5TRTPolicy(nn.Module):
         self.llm_engine.set_runtime_tensor_shape("inputs_embeds", input_embeds.shape)
         self.llm_engine.set_runtime_tensor_shape("attention_mask", vl_input["attention_mask"].shape)
         embeddings = self.llm_engine(input_embeds, vl_input["attention_mask"])["embeddings"]
+        self.maybe_save_debug_features(embeddings, "backbone_embs")
         
-        debug = os.environ.get("TENSORRT_FORWARD_DEBUG", "0") == "1"
-        if debug:
-            debug_embeddings = torch.load(ROOT / "debug" / "llm_embs.pt", weights_only=True)
-            if not torch.allclose(embeddings.cpu(), debug_embeddings.cpu(), atol=1e-5):
-                print("Warning: The embeddings from TensorRT engine do not match the expected values. This may lead to different action predictions compared to PyTorch inference.")
-                print(f"Max absolute difference: {(embeddings.cpu() - debug_embeddings.cpu()).abs().max().item()}")
-                print(f"Mean absolute difference: {(embeddings.cpu() - debug_embeddings.cpu()).abs().mean().item()}")
-                input("Press Enter to continue...")
         return {
             "backbone_features": embeddings,
             "backbone_attention_mask": vl_input["attention_mask"],
@@ -423,16 +350,9 @@ class GR00TN1d5TRTPolicy(nn.Module):
 
         # Prepare inputs for action generation loop
         vl_embs = backbone_output["backbone_features"]
-        debug = os.environ.get("TENSORRT_FORWARD_DEBUG", "0") == "1"
-        if debug:
-            debug_vl_embs = torch.load(ROOT / "debug" / "vl_embs.pt", weights_only=True)
-            if not torch.allclose(vl_embs.cpu(), debug_vl_embs.cpu(), atol=1e-5):
-                print("Warning: The VL embeddings from TensorRT engine do not match the expected values. This may lead to different action predictions compared to PyTorch inference.")
-                print(f"Max absolute difference: {(vl_embs.cpu() - debug_vl_embs.cpu()).abs().max().item()}")
-                print(f"Mean absolute difference: {(vl_embs.cpu() - debug_vl_embs.cpu()).abs().mean().item()}")
-                input("Press Enter to continue...")
         if vl_embs.dtype != torch.float16:
             vl_embs = vl_embs.to(torch.float16)
+        self.maybe_save_debug_features(vl_embs, "vl_embs")
 
         embodiment_id = action_input["embodiment_id"]
         batch_size = vl_embs.shape[0]
@@ -447,14 +367,7 @@ class GR00TN1d5TRTPolicy(nn.Module):
         self.state_encoder_engine.set_runtime_tensor_shape("state", action_input["state"].shape)
         self.state_encoder_engine.set_runtime_tensor_shape("embodiment_id", embodiment_id.shape)
         state_features = self.state_encoder_engine(action_input["state"], embodiment_id)["output"]
-
-        if debug:
-            debug_state_features = torch.load(ROOT / "debug" / "state_features.pt", weights_only=True)
-            if not torch.allclose(state_features.cpu(), debug_state_features.cpu(), atol=1e-5):
-                print("Warning: The state features from TensorRT engine do not match the expected values. This may lead to different action predictions compared to PyTorch inference.")
-                print(f"Max absolute difference: {(state_features.cpu() - debug_state_features.cpu()).abs().max().item()}")
-                print(f"Mean absolute difference: {(state_features.cpu() - debug_state_features.cpu()).abs().mean().item()}")
-                input("Press Enter to continue...")
+        self.maybe_save_debug_features(state_features, "state_features")
 
         # Set initial actions as the sampled noise.
         # This attribute is used to ensure the same actions is used for both PyTorch and TensorRT inference
@@ -485,64 +398,34 @@ class GR00TN1d5TRTPolicy(nn.Module):
             action_features = self.action_encoder_engine(actions, timesteps_tensor, embodiment_id)[
                 "output"
             ]
-            if debug:
-                debug_action_features = torch.load(ROOT / "debug" / f"action_features_before_pos_embed_t{t}.pt", weights_only=True)
-                if not torch.allclose(action_features.cpu(), debug_action_features.cpu(), atol=1e-5):
-                    print("Warning: The action features before position embedding from TensorRT engine do not match the expected values. This may lead to different action predictions compared to PyTorch inference.")
-                    print(f"Max absolute difference: {(action_features.cpu() - debug_action_features.cpu()).abs().max().item()}")
-                    print(f"Mean absolute difference: {(action_features.cpu() - debug_action_features.cpu()).abs().mean().item()}")
-                    input("Press Enter to continue...")
-
+            self.maybe_save_debug_features(action_features, f"action_features_before_pos_embed_t{t}")
+            
             # Maybe add position embedding.
             if self.add_pos_embed:
                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=self.device)
                 pos_embs = self.position_embedding(pos_ids).unsqueeze(0).to(torch.float16)
                 action_features = action_features + pos_embs
-            if debug:
-                debug_action_features = torch.load(ROOT / "debug" / f"action_features_t{t}.pt", weights_only=True)
-                if not torch.allclose(action_features.cpu(), debug_action_features.cpu(), atol=1e-5):
-                    print("Warning: The action features from TensorRT engine do not match the expected values. This may lead to different action predictions compared to PyTorch inference.")
-                    print(f"Max absolute difference: {(action_features.cpu() - debug_action_features.cpu()).abs().max().item()}")
-                    print(f"Mean absolute difference: {(action_features.cpu() - debug_action_features.cpu()).abs().mean().item()}")
-                    input("Press Enter to continue...")
+            self.maybe_save_debug_features(action_features, f"action_features_t{t}")
 
             # Join vision, language, state and action embedding along sequence dimension.
             future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
             sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1).to(
                 torch.float16
             )
-            if debug:
-                debug_sa_embs = torch.load(ROOT / "debug" / f"sa_embs_t{t}.pt", weights_only=True)
-                if not torch.allclose(sa_embs.cpu(), debug_sa_embs.cpu(), atol=1e-5):
-                    print("Warning: The SA embeddings from TensorRT engine do not match the expected values. This may lead to different action predictions compared to PyTorch inference.")
-                    print(f"Max absolute difference: {(sa_embs.cpu() - debug_sa_embs.cpu()).abs().max().item()}")
-                    print(f"Mean absolute difference: {(sa_embs.cpu() - debug_sa_embs.cpu()).abs().mean().item()}")
-                    input("Press Enter to continue...")
+            self.maybe_save_debug_features(sa_embs, f"sa_embs_t{t}")
 
             # Run model forward with batch processing
             self.DiT_engine.set_runtime_tensor_shape("vl_embs", vl_embs.shape)
             self.DiT_engine.set_runtime_tensor_shape("sa_embs", sa_embs.shape)
             self.DiT_engine.set_runtime_tensor_shape("timesteps_tensor", timesteps_tensor.shape)
             model_output = self.DiT_engine(sa_embs, vl_embs, timesteps_tensor)["output"]
-            if debug:
-                debug_model_output = torch.load(ROOT / "debug" / f"model_output_t{t}.pt", weights_only=True)
-                if not torch.allclose(model_output.cpu(), debug_model_output.cpu(), atol=1e-5):
-                    print("Warning: The model output from TensorRT engine do not match the expected values. This may lead to different action predictions compared to PyTorch inference.")
-                    print(f"Max absolute difference: {(model_output.cpu() - debug_model_output.cpu()).abs().max().item()}")
-                    print(f"Mean absolute difference: {(model_output.cpu() - debug_model_output.cpu()).abs().mean().item()}")
-                    input("Press Enter to continue...")
+            self.maybe_save_debug_features(model_output, f"model_output_t{t}")
 
             self.action_decoder_engine.set_runtime_tensor_shape("model_output", model_output.shape)
             self.action_decoder_engine.set_runtime_tensor_shape("embodiment_id", embodiment_id.shape)
             pred = self.action_decoder_engine(model_output, embodiment_id)["output"]
             pred_velocity = pred[:, -self.action_horizon :]
-            if debug:
-                debug_pred_velocity = torch.load(ROOT / "debug" / f"pred_velocity_t{t}.pt", weights_only=True)
-                if not torch.allclose(pred_velocity.cpu(), debug_pred_velocity.cpu(), atol=1e-5):
-                    print("Warning: The predicted velocity from TensorRT engine do not match the expected values. This may lead to different action predictions compared to PyTorch inference.")
-                    print(f"Max absolute difference: {(pred_velocity.cpu() - debug_pred_velocity.cpu()).abs().max().item()}")
-                    print(f"Mean absolute difference: {(pred_velocity.cpu() - debug_pred_velocity.cpu()).abs().mean().item()}")
-                    input("Press Enter to continue...")
+            self.maybe_save_debug_features(pred_velocity, f"pred_velocity_t{t}")
 
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity
@@ -745,6 +628,14 @@ class GR00TN1d5TRTPolicy(nn.Module):
                 return False
         return True
 
+    def maybe_save_debug_features(self, features: torch.Tensor, feat_name: str) -> None:
+        """Utility function to save intermediate features for debugging."""
+        if not self.debug_pipeline:
+            return
+        save_file = ROOT / "debug" / "trt_runner" / f"{feat_name}.pt"
+        Path(save_file).parent.mkdir(parents=True, exist_ok=True)
+        torch.save(features.cpu(), save_file)
+
 
 if __name__ == "__main__":
     TRT_ENGINE_PATH = ROOT / "gr00t_engine"
@@ -823,5 +714,3 @@ if __name__ == "__main__":
 
     del policy
     torch.cuda.empty_cache()
-
-    compare_predictions(pred_tensorrt=pred_tensorrt, pred_torch=pred_torch)

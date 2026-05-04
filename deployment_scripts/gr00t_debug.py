@@ -15,10 +15,13 @@
 
 import argparse
 import os
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[1]
 
 import numpy as np
 
 import torch
+from gr00t_inference import compare_predictions
 from trt_model_forward import setup_tensorrt_engines
 from trt_runner import GR00TN1d5TRTPolicy
 
@@ -27,68 +30,19 @@ from gr00t.data.dataset import LeRobotSingleDataset
 from gr00t.model.policy import Gr00tPolicy
 
 
-def compare_predictions(pred_tensorrt, pred_torch):
-    """
-    Compare the similarity between TensorRT and PyTorch predictions
+def validate_features(feat_name: str) -> None:
+    trt_runner_feats = torch.load(ROOT / "debug" / "trt_runner" / f"{feat_name}.pt", weights_only=True)
+    trt_gr00t_feats = torch.load(ROOT / "debug" / "trt_gr00t" / f"{feat_name}.pt", weights_only=True)
 
-    Args:
-        pred_tensorrt: TensorRT prediction results (numpy array)
-        pred_torch: PyTorch prediction results (numpy array)
-    """
-    print("\n=== Prediction Comparison ===")
-
-    # Ensure both predictions contain the same keys
-    assert pred_tensorrt.keys() == pred_torch.keys(), "Prediction keys do not match"
-
-    # Calculate max label width for alignment
-    max_label_width = max(
-        len("Cosine Similarity (PyTorch/TensorRT):"),
-        len("L1 Mean/Max Distance (PyTorch/TensorRT):"),
-        len("Max Output Values (PyTorch/TensorRT):"),
-        len("Mean Output Values (PyTorch/TensorRT):"),
-        len("Min Output Values (PyTorch/TensorRT):"),
-    )
-
-    for key in pred_tensorrt.keys():
-        tensorrt_array = pred_tensorrt[key]
-        torch_array = pred_torch[key]
-
-        # Convert to PyTorch tensors
-        tensorrt_tensor = torch.from_numpy(tensorrt_array).to(torch.float32)
-        torch_tensor = torch.from_numpy(torch_array).to(torch.float32)
-
-        # Ensure tensor shapes are the same
-        assert (
-            tensorrt_tensor.shape == torch_tensor.shape
-        ), f"{key} shapes do not match: {tensorrt_tensor.shape} vs {torch_tensor.shape}"
-
-        # Calculate cosine similarity
-        flat_tensorrt = tensorrt_tensor.flatten()
-        flat_torch = torch_tensor.flatten()
-
-        # Manually calculate cosine similarity
-        dot_product = torch.dot(flat_tensorrt, flat_torch)
-        norm_tensorrt = torch.norm(flat_tensorrt)
-        norm_torch = torch.norm(flat_torch)
-        cos_sim = dot_product / (norm_tensorrt * norm_torch)
-
-        # Calculate L1 distance
-        l1_dist = torch.abs(flat_tensorrt - flat_torch)
-
-        print(f"\n{key}:")
-        print(f'{"Cosine Similarity (PyTorch/TensorRT):".ljust(max_label_width)} {cos_sim.item()}')
+    if not torch.allclose(trt_runner_feats.cpu(), trt_gr00t_feats.cpu(), atol=1e-5):
         print(
-            f'{"L1 Mean/Max Distance (PyTorch/TensorRT):".ljust(max_label_width)} {l1_dist.mean().item():.4f}/{l1_dist.max().item():.4f}'
+            f"Warning: The features {feat_name} from TensorRT runner do not match the expected values from GR00T. "\
+            "This may lead to different action predictions compared to PyTorch inference."
         )
-        print(
-            f'{"Max Output Values (PyTorch/TensorRT):".ljust(max_label_width)} {torch_tensor.max().item():.4f}/{tensorrt_tensor.max().item():.4f}'
-        )
-        print(
-            f'{"Mean Output Values (PyTorch/TensorRT):".ljust(max_label_width)} {torch_tensor.mean().item():.4f}/{tensorrt_tensor.mean().item():.4f}'
-        )
-        print(
-            f'{"Min Output Values (PyTorch/TensorRT):".ljust(max_label_width)} {torch_tensor.min().item():.4f}/{tensorrt_tensor.min().item():.4f}'
-        )
+        errors = (trt_runner_feats.cpu() - trt_gr00t_feats.cpu()).abs()
+        print(f"Max absolute difference: {errors.max().item()}")
+        print(f"Mean absolute difference: {errors.mean().item()}")
+        input("Press Enter to continue...")
 
 
 if __name__ == "__main__":
@@ -135,6 +89,7 @@ if __name__ == "__main__":
     REPO_PATH = os.path.dirname(os.path.dirname(gr00t.__file__))
     DATASET_PATH = os.path.join(REPO_PATH, "demo_data", "robot_sim.PickNPlace")
     EMBODIMENT_TAG = "gr1"
+    denoising_steps = 4
     device = "cuda"
 
     # Load data config
@@ -169,7 +124,7 @@ if __name__ == "__main__":
         embodiment_tag=EMBODIMENT_TAG,
         modality_config=modality_config,
         modality_transform=modality_transform,
-        denoising_steps=4,
+        denoising_steps=denoising_steps,
         device=device,
     )
     if not hasattr(policy.model.action_head, "init_actions"):
@@ -204,13 +159,26 @@ if __name__ == "__main__":
         vit_dtype=args.vit_dtype,
         llm_dtype=args.llm_dtype,
         dit_dtype=args.dit_dtype,
-        denoising_steps=4,
+        denoising_steps=denoising_steps,
         device=device,
+        debug_pipeline=True
     )
     policy.init_actions = init_actions
     pred_tensorrt = policy.get_action(step_data)
 
-
+    
     # Compare predictions
+    print("\n\n\n========== VALIDATING INTERMEDIATE FEATURES ==========")
+    validate_features("backbone_embs")
+    validate_features("vl_embs")
+    validate_features("state_features")
+    for t in range(denoising_steps):
+        validate_features(f"action_features_before_pos_embed_t{t}")
+        validate_features(f"action_features_t{t}")
+        validate_features(f"sa_embs_t{t}")
+        validate_features(f"model_output_t{t}")
+        validate_features(f"pred_velocity_t{t}")
+    print("*** Validation completed. All features were matched. ***")
+    
     print("\n\n\n========== COMPARING TENSORRT AND PYTORCH PREDICTIONS ==========")
     compare_predictions(pred_tensorrt, pred_pytorch)
