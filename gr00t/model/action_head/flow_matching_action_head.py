@@ -361,11 +361,14 @@ class FlowmatchingActionHead(nn.Module):
         # Set initial actions as the sampled noise.
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
-        actions = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.config.action_dim),
-            dtype=vl_embs.dtype,
-            device=device,
-        )
+        if hasattr(self, "init_actions"):
+            actions = self.init_actions.expand((batch_size, -1, -1))
+        else:
+            actions = torch.randn(
+                batch_size, self.config.action_horizon, self.config.action_dim,
+                dtype=vl_embs.dtype,
+                device=device,
+            )
 
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps

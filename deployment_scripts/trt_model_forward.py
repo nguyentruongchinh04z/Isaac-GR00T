@@ -14,6 +14,11 @@
 # limitations under the License.
 
 import os
+from pathlib import Path
+
+from matplotlib.offsetbox import DEBUG
+ROOT = Path(__file__).resolve().parents[1]
+
 from functools import partial
 
 import torch
@@ -40,7 +45,6 @@ def eagle_tensorrt_forward(self, vl_input):
     assert (
         vl_input["pixel_values"].shape[0] <= 8
     ), "Batch size must be <= 8 because TensorRT engine was built with max_batch_size=8, you can try to adjust the max_batch_size in the build_engine.sh script and rebuild the engine."
-
     self.vit_engine.set_runtime_tensor_shape("pixel_values", vl_input["pixel_values"].shape)
     self.vit_engine.set_runtime_tensor_shape("position_ids", position_ids.shape)
     vit_embeds = self.vit_engine(vl_input["pixel_values"], position_ids)["vit_embeds"]
@@ -92,7 +96,12 @@ def eagle_tensorrt_forward(self, vl_input):
     self.llm_engine.set_runtime_tensor_shape("inputs_embeds", input_embeds.shape)
     self.llm_engine.set_runtime_tensor_shape("attention_mask", vl_input["attention_mask"].shape)
     embeddings = self.llm_engine(input_embeds, vl_input["attention_mask"])["embeddings"]
-
+    debug = (os.environ.get("TENSORRT_FORWARD_DEBUG", "0") == "1")
+    if debug:
+        if not (ROOT / "debug").exists():
+            (ROOT / "debug").mkdir()
+        torch.save(embeddings.cpu(), ROOT / "debug" / "llm_embs.pt")
+    
     return BatchFeature(
         data={
             "backbone_features": embeddings,
@@ -112,6 +121,12 @@ def action_head_tensorrt_forward(self, backbone_output, action_input):
         backbone_output.backbone_features
     )["output"]
     vl_embs = backbone_output.backbone_features
+    debug = (os.environ.get("TENSORRT_FORWARD_DEBUG", "0") == "1")
+    if debug:
+        if not (ROOT / "debug").exists():
+            (ROOT / "debug").mkdir()
+        torch.save(vl_embs.cpu(), ROOT / "debug" / "vl_embs.pt")
+
     embodiment_id = action_input.embodiment_id
     batch_size = vl_embs.shape[0]
 
@@ -125,11 +140,15 @@ def action_head_tensorrt_forward(self, backbone_output, action_input):
         vl_embs = vl_embs.to(torch.float16)
 
     # Embed state with batch processing
-
     self.state_encoder_engine.set_runtime_tensor_shape("state", action_input.state.shape)
     self.state_encoder_engine.set_runtime_tensor_shape("embodiment_id", embodiment_id.shape)
     state_features = self.state_encoder_engine(action_input.state, embodiment_id)["output"]
-
+    debug = (os.environ.get("TENSORRT_FORWARD_DEBUG", "0") == "1")
+    if debug:
+        if not (ROOT / "debug").exists():
+            (ROOT / "debug").mkdir()
+        torch.save(state_features.cpu(), ROOT / "debug" / "state_features.pt")
+    
     # Set initial actions as the sampled noise.
     device = vl_embs.device
 
@@ -138,7 +157,7 @@ def action_head_tensorrt_forward(self, backbone_output, action_input):
         actions = self.init_actions.expand((batch_size, -1, -1))
     else:
         actions = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.config.action_dim),
+            batch_size, self.config.action_horizon, self.config.action_dim,
             dtype=vl_embs.dtype,
             device=device,
         )
@@ -161,18 +180,34 @@ def action_head_tensorrt_forward(self, backbone_output, action_input):
         action_features = self.action_encoder_engine(actions, timesteps_tensor, embodiment_id)[
             "output"
         ]
+        debug = (os.environ.get("TENSORRT_FORWARD_DEBUG", "0") == "1")
+        if debug:
+            if not (ROOT / "debug").exists():
+                (ROOT / "debug").mkdir()
+            torch.save(action_features.cpu(), ROOT / "debug" / f"action_features_before_pos_embed_t{t}.pt")
 
         # Maybe add position embedding.
         if self.config.add_pos_embed:
             pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
             pos_embs = self.position_embedding(pos_ids).unsqueeze(0).to(torch.float16)
             action_features = action_features + pos_embs
+        debug = (os.environ.get("TENSORRT_FORWARD_DEBUG", "0") == "1")
+        if debug:
+            if not (ROOT / "debug").exists():
+                (ROOT / "debug").mkdir()
+            torch.save(action_features.cpu(), ROOT / "debug" / f"action_features_t{t}.pt")
 
         # Join vision, language, state and action embedding along sequence dimension.
         future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
         sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1).to(
             torch.float16
         )
+        debug = (os.environ.get("TENSORRT_FORWARD_DEBUG", "0") == "1")
+        if debug:
+            if not (ROOT / "debug").exists():
+                (ROOT / "debug").mkdir()
+            torch.save(sa_embs.cpu(), ROOT / "debug" / f"sa_embs_t{t}.pt")
+        
         # Run model forward with batch processing
         if vl_embs.dtype != torch.float16:
             vl_embs = vl_embs.to(torch.float16)
@@ -181,11 +216,21 @@ def action_head_tensorrt_forward(self, backbone_output, action_input):
         self.DiT_engine.set_runtime_tensor_shape("sa_embs", sa_embs.shape)
         self.DiT_engine.set_runtime_tensor_shape("timesteps_tensor", timesteps_tensor.shape)
         model_output = self.DiT_engine(sa_embs, vl_embs, timesteps_tensor)["output"]
+        debug = (os.environ.get("TENSORRT_FORWARD_DEBUG", "0") == "1")
+        if debug:
+            if not (ROOT / "debug").exists():
+                (ROOT / "debug").mkdir()
+            torch.save(model_output.cpu(), ROOT / "debug" / f"model_output_t{t}.pt")
 
         self.action_decoder_engine.set_runtime_tensor_shape("model_output", model_output.shape)
         self.action_decoder_engine.set_runtime_tensor_shape("embodiment_id", embodiment_id.shape)
         pred = self.action_decoder_engine(model_output, embodiment_id)["output"]
         pred_velocity = pred[:, -self.action_horizon :]
+        debug = (os.environ.get("TENSORRT_FORWARD_DEBUG", "0") == "1")
+        if debug:
+            if not (ROOT / "debug").exists():
+                (ROOT / "debug").mkdir()
+            torch.save(pred_velocity.cpu(), ROOT / "debug" / f"pred_velocity_t{t}.pt")
 
         # Update actions using euler integration.
         actions = actions + dt * pred_velocity

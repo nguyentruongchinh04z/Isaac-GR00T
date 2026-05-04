@@ -36,9 +36,9 @@ else   # one video view (default)
 fi
 
 # Define precision settings (can be overridden via environment variables)
-VIT_DTYPE=${VIT_DTYPE:-fp8}     # Options: fp16, fp8
-LLM_DTYPE=${LLM_DTYPE:-nvfp4}   # Options: fp16, nvfp4, nvfp4_full, fp8
-DIT_DTYPE=${DIT_DTYPE:-fp8}     # Options: fp16, fp8
+VIT_DTYPE=${VIT_DTYPE:-fp16}     # Options: fp16, fp8
+LLM_DTYPE=${LLM_DTYPE:-fp16}   # Options: fp16, nvfp4, nvfp4_full, fp8
+DIT_DTYPE=${DIT_DTYPE:-fp16}     # Options: fp16, fp8
 
 # Define max batch size (default 8, will be overridden for nvfp4 LLM variants)
 MAX_BATCH=${MAX_BATCH:-8}

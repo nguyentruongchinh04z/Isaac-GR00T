@@ -15,11 +15,12 @@
 
 import argparse
 import os
-from functools import partial
+
+import numpy as np
 
 import torch
-from action_head_utils import action_head_pytorch_forward
 from trt_model_forward import setup_tensorrt_engines
+from trt_runner import GR00TN1d5TRTPolicy
 
 import gr00t
 from gr00t.data.dataset import LeRobotSingleDataset
@@ -96,37 +97,6 @@ if __name__ == "__main__":
         "--model-path", type=str, default="nvidia/GR00T-N1.5-3B", help="Path to the GR00T model"
     )
     parser.add_argument(
-        "--dataset-path",
-        type=str,
-        default=None,
-        help="Path to the dataset (default: demo_data/robot_sim.PickNPlace)",
-    )
-    parser.add_argument(
-        "--data-config",
-        type=str,
-        default="fourier_gr1_arms_only",
-        help="The name of the data config to use (e.g. fourier_gr1_arms_only) or a path to a custom data config file (e.g. 'module:ClassName')",
-    )
-    parser.add_argument(
-        "--embodiment-tag",
-        type=str,
-        default="gr1",
-        help="The embodiment tag for the model (e.g. gr1, g1, so100, etc.)",
-    )
-    parser.add_argument(
-        "--inference-mode",
-        type=str,
-        choices=["pytorch", "tensorrt", "compare"],
-        default="pytorch",
-        help="Inference mode: 'pytorch' for PyTorch inference, 'tensorrt' for TensorRT inference, 'compare' for compare PyTorch and TensorRT outputs similarity",
-    )
-    parser.add_argument(
-        "--denoising-steps",
-        type=int,
-        help="Number of denoising steps",
-        default=4,
-    )
-    parser.add_argument(
         "--trt-engine-path",
         type=str,
         help="Path to the TensorRT engine",
@@ -162,34 +132,18 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    MODEL_PATH = args.model_path
     REPO_PATH = os.path.dirname(os.path.dirname(gr00t.__file__))
-    DATASET_PATH = (
-        args.dataset_path
-        if args.dataset_path
-        else os.path.join(REPO_PATH, "demo_data/robot_sim.PickNPlace")
-    )
-    EMBODIMENT_TAG = args.embodiment_tag
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    DATASET_PATH = os.path.join(REPO_PATH, "demo_data", "robot_sim.PickNPlace")
+    EMBODIMENT_TAG = "gr1"
+    device = "cuda"
 
     # Load data config
     from gr00t.experiment.data_config import load_data_config
-
-    data_config = load_data_config(args.data_config)
+    data_config = load_data_config("fourier_gr1_arms_only")
     modality_config = data_config.modality_config()
     modality_transform = data_config.transform()
 
-    policy = Gr00tPolicy(
-        model_path=MODEL_PATH,
-        embodiment_tag=EMBODIMENT_TAG,
-        modality_config=modality_config,
-        modality_transform=modality_transform,
-        denoising_steps=args.denoising_steps,
-        device=device,
-    )
-
-    modality_config = policy.modality_config
+    # Load dataset and extract the first step data
     dataset = LeRobotSingleDataset(
         dataset_path=DATASET_PATH,
         modality_configs=modality_config,
@@ -198,45 +152,65 @@ if __name__ == "__main__":
         transforms=None,  # We'll handle transforms separately through the policy
         embodiment_tag=EMBODIMENT_TAG,
     )
-
+    print("\n\n\n========== DATASET LOADED ==========")
+    
     step_data = dataset[0]
-
-    if args.inference_mode == "pytorch":
-        predicted_action = policy.get_action(step_data)
-        print("\n=== PyTorch Inference Results ===")
-        for key, value in predicted_action.items():
+    print("\n\n\n========== STEP DATA SCHEMA ==========")
+    for key, value in step_data.items():
+        if isinstance(value, np.ndarray):
             print(key, value.shape)
-
-    elif args.inference_mode == "tensorrt":
-        # Setup TensorRT engines
-        setup_tensorrt_engines(
-            policy, args.trt_engine_path, args.vit_dtype, args.llm_dtype, args.dit_dtype
+        else:
+            print(key, value)
+        
+    # Set environment variable to enable debug mode in TensorRT forward pass
+    print("\n\n\n========== RUNNING NATIVE PYTORCH INFERENCE ==========")
+    policy = Gr00tPolicy(
+        model_path=args.model_path,
+        embodiment_tag=EMBODIMENT_TAG,
+        modality_config=modality_config,
+        modality_transform=modality_transform,
+        denoising_steps=4,
+        device=device,
+    )
+    if not hasattr(policy.model.action_head, "init_actions"):
+        policy.model.action_head.init_actions = torch.zeros(
+            1, policy.model.action_head.action_horizon, policy.model.action_head.action_dim,
+            dtype=torch.float16,
+            device=device,
         )
+    pred_pytorch = policy.get_action(step_data)
 
-        predicted_action = policy.get_action(step_data)
-        print("\n=== TensorRT Inference Results ===")
-        for key, value in predicted_action.items():
-            print(key, value.shape)
+    # Setup TensorRT engines with debug mode enabled for getting debug features
+    print("\n\n\n========== SETTING UP TENSORRT ENGINES WITH DEBUG MODE ENABLED ==========")
+    os.environ["TENSORRT_FORWARD_DEBUG"] = "1" 
+    setup_tensorrt_engines(
+        policy, args.trt_engine_path, args.vit_dtype, args.llm_dtype, args.dit_dtype
+    )
+    policy.get_action(step_data)
+    
+    # Free up GPU memory before loading the TensorRT Runner
+    init_actions = policy.model.action_head.init_actions
+    del policy
+    torch.cuda.empty_cache()
 
-    else:
-        # ensure PyTorch and TensorRT have the same init_actions
-        if not hasattr(policy.model.action_head, "init_actions"):
-            policy.model.action_head.init_actions = torch.zeros(
-                1, policy.model.action_head.action_horizon, policy.model.action_head.action_dim,
-                dtype=torch.float16,
-                device=device,
-            )
-        # PyTorch inference
-        policy.model.action_head.get_action = partial(
-            action_head_pytorch_forward, policy.model.action_head
-        )
-        predicted_action_torch = policy.get_action(step_data)
+    # Load the TRT Runner debug outputs and compare with PyTorch outputs
+    print("\n\n\n========== RUNNING TENSORRT RUNNER ==========")
+    policy = GR00TN1d5TRTPolicy(
+        model_path=args.model_path,
+        embodiment_tag=EMBODIMENT_TAG,
+        modality_config=modality_config,
+        modality_transform=modality_transform,
+        trt_engine_path=args.trt_engine_path,
+        vit_dtype=args.vit_dtype,
+        llm_dtype=args.llm_dtype,
+        dit_dtype=args.dit_dtype,
+        denoising_steps=4,
+        device=device,
+    )
+    policy.init_actions = init_actions
+    pred_tensorrt = policy.get_action(step_data)
 
-        # Setup TensorRT engines and run inference
-        setup_tensorrt_engines(
-            policy, args.trt_engine_path, args.vit_dtype, args.llm_dtype, args.dit_dtype
-        )
-        predicted_action_tensorrt = policy.get_action(step_data)
 
-        # Compare predictions
-        compare_predictions(predicted_action_tensorrt, predicted_action_torch)
+    # Compare predictions
+    print("\n\n\n========== COMPARING TENSORRT AND PYTORCH PREDICTIONS ==========")
+    compare_predictions(pred_tensorrt, pred_pytorch)

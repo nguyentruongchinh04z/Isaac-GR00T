@@ -122,3 +122,7 @@ playground/
 demo_data/gr00t-gr1-apple-to-shelf/
 tmp/
 output/
+weights/
+gr00t_engine/
+gr00t_onnx/
+debug/
